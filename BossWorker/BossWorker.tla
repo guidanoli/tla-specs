@@ -20,99 +20,176 @@ EXTENDS Naturals, FiniteSets
 (* Specification of the BossWorker smart contract                          *)
 (***************************************************************************)
 
-CONSTANT possibleWorkers, possibleClaims, emptyClaim
-VARIABLES rollupsPhase, workerStatus, correctClaim, claim
+CONSTANT possibleWorkers, possibleClaims
+VARIABLES rollupsPhase, workerStatus, correctClaim, claimStatus, bossStatus
 
 (***************************************************************************)
 (* Useful global definitions                                               *)
 (***************************************************************************)
 
-RollupsPhase == 
-    {"InputAccumulation", \* receiving inputs
-     "ClaimSuggestion",   \* accepting suggestions from workers
-     "ClaimValidation",   \* validating claims suggested by workers
-     "ClaimSubmission"}   \* workers can submit claim
+RollupsPhase ==
+    {"InputAccumulation", \* receiving inputs (correct claim may change)
+     "ClaimSuggestion",   \* workers can suggest claims and the boss can remove them
+     "ClaimSubmission"}   \* anyone can submit suggested claims
 
 WorkerStatus ==
     {"Unemployed", \* worker does nothing
-     "Employed"}   \* worker can suggest and submit claims
+     "Employed"}   \* worker can suggest claims
+
+ClaimStatus ==
+    {"NotSuggested", \* no worker has suggested such claim
+     "Suggested"}    \* some worker has suggested this claim
+
+BossStatus ==
+    {"Idle",     \* boss is not prompted to do anything
+     "Prompted", \* boss is prompted to validate suggested claims
+     "NotHappy", \* boss is not happy with claim
+     "Happy"}    \* boss is happy with claim (final state until new epoch)
+
+EmployedWorkers ==
+    { worker \in possibleWorkers : workerStatus[worker] = "Employed" }
+
+UnemployedWorkers ==
+    { worker \in possibleWorkers : workerStatus[worker] = "Unemployed" }
+
+SuggestedClaims ==
+    { claim \in possibleClaims : claimStatus[claim] = "Suggested" }
+
+EmptyClaimStatus ==
+    [ claim \in possibleClaims |-> "NotSuggested" ]
+
+(***************************************************************************)
+(* Invariants                                                              *)
+(***************************************************************************)
 
 TypeOK ==
     /\ workerStatus \in [possibleWorkers -> WorkerStatus]
+    /\ claimStatus \in [possibleClaims -> ClaimStatus]
+    /\ bossStatus \in BossStatus
     /\ rollupsPhase \in RollupsPhase
     /\ correctClaim \in possibleClaims
-    /\ emptyClaim \notin possibleClaims
-    /\ claim \in possibleClaims \union {emptyClaim}
-    /\ Cardinality({ worker \in possibleWorkers : workerStatus[worker] = "Employed" }) \in {0, 1}
+    /\ Cardinality(SuggestedClaims) \in {0, 1}
+    /\ Cardinality(EmployedWorkers) \in {0, 1}
+
+CorrectSubmittableClaim ==
+    rollupsPhase = "ClaimSubmission" =>
+        \A claim \in SuggestedClaims : claim = correctClaim
 
 (***************************************************************************)
-(* Initial state definition                                                *)
+(* Initial state                                                           *)
 (***************************************************************************)
 
 Init ==
     /\ workerStatus = [worker \in possibleWorkers |-> "Unemployed"]
+    /\ claimStatus = EmptyClaimStatus
     /\ rollupsPhase \in RollupsPhase
     /\ correctClaim \in possibleClaims
-    /\ claim = emptyClaim
+    /\ bossStatus = "Idle"
 
 (***************************************************************************)
-(* Worker status changes                                                   *)
+(* Worker behaviour                                                        *)
 (***************************************************************************)
 
-HireWorker ==
-    /\ ~ \E worker \in possibleWorkers :
-        workerStatus[worker] = "Employed"
-    /\ \E worker \in possibleWorkers :
-        /\ workerStatus[worker] = "Unemployed"
+WorkerSuggestsClaim ==
+    \E worker \in EmployedWorkers :
+        \E newClaim \in possibleClaims :
+            /\ rollupsPhase = "ClaimSuggestion"
+            /\ SuggestedClaims = {} \* (cannot suggest twice)
+            /\ claimStatus' = [EmptyClaimStatus EXCEPT ![newClaim] = "Suggested"]
+            /\ UNCHANGED <<rollupsPhase, workerStatus, correctClaim, bossStatus>>
+
+(***************************************************************************)
+(* Boss behaviour                                                          *)
+(***************************************************************************)
+
+BossHiresWorker ==
+    \E worker \in UnemployedWorkers :
+        (**********************************************************************)
+        (* The boss should not hire a worker while prompted because then a    *)
+        (* malicious worker might be able to suggest a bad claim leaving the  *)
+        (* boss with too little time to fire him and to remove the claim      *)
+        (**********************************************************************)
+        /\ bossStatus = "Idle"
+        /\ EmployedWorkers = {} \* (cannot have multiple workers at the same time)
         /\ workerStatus' = [workerStatus EXCEPT ![worker] = "Employed"]
-        /\ UNCHANGED <<rollupsPhase, correctClaim, claim>>
+        /\ UNCHANGED <<rollupsPhase, correctClaim, claimStatus, bossStatus>>
 
-FireWorker ==
-    \E worker \in possibleWorkers :
-        /\ workerStatus[worker] = "Employed"
+BossFiresWorkerAndRemovesClaim ==
+    \E worker \in EmployedWorkers :
+        /\ claimStatus' = EmptyClaimStatus
         /\ workerStatus' = [workerStatus EXCEPT ![worker] = "Unemployed"]
-        /\ UNCHANGED <<rollupsPhase, correctClaim, claim>>
+        /\ UNCHANGED <<rollupsPhase, correctClaim, bossStatus>>
+
+BossIsPrompted ==
+    /\ rollupsPhase = "ClaimSuggestion"
+    /\ bossStatus = "Idle"
+    /\ bossStatus' = "Prompted"
+    /\ UNCHANGED <<rollupsPhase, correctClaim, claimStatus, workerStatus>>
+
+BossValidatesClaim ==
+    /\ rollupsPhase = "ClaimSuggestion"
+    /\ bossStatus = "Prompted"
+    /\ IF correctClaim \in SuggestedClaims
+       THEN bossStatus' = "Happy"
+       ELSE bossStatus' = "NotHappy"
+    /\ UNCHANGED <<rollupsPhase, correctClaim, claimStatus, workerStatus>>
+
+BossGetsHappy ==
+    /\ rollupsPhase = "ClaimSuggestion"
+    /\ bossStatus = "NotHappy"
+    /\ EmployedWorkers = {} \* worker was fired
+    /\ SuggestedClaims = {} \* claim was removed
+    /\ bossStatus' = "Happy"
+    /\ UNCHANGED <<rollupsPhase, correctClaim, claimStatus, workerStatus>>
 
 (***************************************************************************)
-(* Rollups phase-related changes                                           *)
+(* User behaviour                                                          *)
 (***************************************************************************)
 
-SendInput ==
+UserSendsInput ==
     /\ rollupsPhase = "InputAccumulation"
     /\ correctClaim' \in possibleClaims \* (machine hash changes)
-    /\ UNCHANGED <<rollupsPhase, workerStatus, claim>>
+    /\ UNCHANGED <<rollupsPhase, workerStatus, claimStatus, bossStatus>>
 
-SuggestClaim ==
-    \E worker \in possibleWorkers:
-        /\ workerStatus[worker] = "Employed"
-        /\ rollupsPhase = "ClaimSuggestion"
-        /\ claim' \in possibleClaims \* (the order of claims is ignored)
-        /\ UNCHANGED <<rollupsPhase, workerStatus, correctClaim>>
+UserSubmitsClaim ==
+    \E claim \in SuggestedClaims :
+        /\ rollupsPhase = "ClaimSubmission"
+        /\ claimStatus' = EmptyClaimStatus \* (new epoch, new claims)
+        /\ UNCHANGED <<rollupsPhase, workerStatus, correctClaim, bossStatus>>
+
+(***************************************************************************)
+(* Rollups behaviour                                                       *)
+(***************************************************************************)
 
 NextPhase ==
    \/ /\ rollupsPhase = "InputAccumulation"
       /\ rollupsPhase' = "ClaimSuggestion"
-      /\ UNCHANGED <<workerStatus, correctClaim, claim>>
+      /\ UNCHANGED <<workerStatus, correctClaim, claimStatus, bossStatus>>
    \/ /\ rollupsPhase = "ClaimSuggestion"
+      /\ bossStatus = "Happy" \* (we assume the boss has enough time)
       /\ rollupsPhase' = "ClaimSubmission"
-      /\ UNCHANGED <<workerStatus, correctClaim, claim>>
+      /\ UNCHANGED <<workerStatus, correctClaim, claimStatus, bossStatus>>
    \/ /\ rollupsPhase = "ClaimSubmission"
       /\ rollupsPhase' = "InputAccumulation"
-      /\ claim' = emptyClaim
-      /\ UNCHANGED <<workerStatus, correctClaim>>
+      /\ bossStatus' = "Idle"
+      /\ UNCHANGED <<workerStatus, correctClaim, claimStatus>>
 
 (***************************************************************************)
-(* Next state definition                                                   *)
+(* Next state                                                              *)
 (***************************************************************************)
 
 Next ==
-    \/ HireWorker
-    \/ FireWorker
-    \/ SendInput
-    \/ SuggestClaim
+    \/ BossHiresWorker
+    \/ BossFiresWorkerAndRemovesClaim
+    \/ BossIsPrompted
+    \/ BossValidatesClaim
+    \/ BossGetsHappy
+    \/ UserSendsInput
+    \/ WorkerSuggestsClaim
+    \/ UserSubmitsClaim
     \/ NextPhase
 
 =============================================================================
 \* Modification History
-\* Last modified Tue May 31 15:52:57 BRT 2022 by guilherme
+\* Last modified Wed Jun 01 00:36:17 BRT 2022 by guilherme
 \* Created Mon May 30 11:40:33 BRT 2022 by guilherme
